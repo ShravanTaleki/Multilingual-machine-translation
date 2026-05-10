@@ -42,10 +42,35 @@ function Chat({ currentUser, onLogout, onUpdateUser, theme, toggleTheme }) {
               : received.sender;
 
             if (otherUser) {
-              setConversations(prev => ({
-                ...prev,
-                [otherUser]: [...(prev[otherUser] || []), received]
-              }));
+              setConversations(prev => {
+                const existing = prev[otherUser] || [];
+                const messageId = received.messageId;
+
+                // If this is a translation update (pending=false), replace the pending entry
+                if (messageId && received.pending === 'false') {
+                  const idx = existing.findIndex(m => m.messageId === messageId);
+                  if (idx !== -1) {
+                    const updated = [...existing];
+                    updated[idx] = received;
+                    return { ...prev, [otherUser]: updated };
+                  }
+                }
+
+                // If this is our own sent message (sender echo), replace optimistic placeholder
+                if (received.sender === currentUser.username) {
+                  const pendingIdx = [...existing].reverse()
+                    .findIndex(m => m.pending === true && m.original === received.original);
+                  if (pendingIdx !== -1) {
+                    const realIdx = existing.length - 1 - pendingIdx;
+                    const updated = [...existing];
+                    updated[realIdx] = received;
+                    return { ...prev, [otherUser]: updated };
+                  }
+                }
+
+                // New message — append it
+                return { ...prev, [otherUser]: [...existing, received] };
+              });
             }
 
             // Track incoming senders and mark unread
@@ -100,6 +125,20 @@ function Chat({ currentUser, onLogout, onUpdateUser, theme, toggleTheme }) {
 
   const sendMessage = () => {
     if (!messageInput.trim() || !activeChat || !connected) return;
+
+    const optimisticMsg = {
+      sender: currentUser.username,
+      original: messageInput,
+      translated: messageInput,
+      timestamp: new Date().toISOString(),
+      pending: true,
+    };
+
+    // Immediately show the message in the UI (optimistic update)
+    setConversations(prev => ({
+      ...prev,
+      [activeChat.username]: [...(prev[activeChat.username] || []), optimisticMsg],
+    }));
 
     stompClient.current.publish({
       destination: '/app/chat.send',
@@ -223,7 +262,10 @@ function Chat({ currentUser, onLogout, onUpdateUser, theme, toggleTheme }) {
                   className={`message ${msg.sender === currentUser.username ? 'sent' : 'received'}`}
                 >
                   <div className="message-bubble">
-                    <div className="message-text">{msg.translated}</div>
+                    <div className="message-text">
+                      {msg.translated}
+                      {msg.pending && <span style={{ opacity: 0.5, marginLeft: '6px', fontSize: '11px' }}>⏳</span>}
+                    </div>
                     {msg.original !== msg.translated && (
                       <div className="message-original">Original: {msg.original}</div>
                     )}

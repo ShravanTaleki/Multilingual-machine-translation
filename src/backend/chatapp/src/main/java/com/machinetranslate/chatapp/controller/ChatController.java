@@ -6,14 +6,17 @@ import com.machinetranslate.chatapp.repository.MessageRepository;
 import com.machinetranslate.chatapp.repository.UserRepository;
 import com.machinetranslate.chatapp.service.TranslationService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Controller;
-import java.util.HashMap;
+import java.util.*;
+import java.util.stream.Collectors;
 
-import java.util.Map;
-
+@Slf4j
 @Controller
 @RequiredArgsConstructor
 public class ChatController {
@@ -34,38 +37,81 @@ public class ChatController {
         User receiver = userRepository.findByUsername(receiverUsername)
                 .orElseThrow(() -> new RuntimeException("Receiver not found"));
 
-        String translated = translationService.translate(
-                text,
-                receiver.getPreferredLanguage()
-        );
-
+        // ── Phase 1: Instant delivery ─────────────────────────────────────
+        // Save with original text immediately so the message is persisted
         Message message = new Message();
         message.setSender(sender);
         message.setReceiver(receiver);
         message.setOriginalText(text);
-        message.setTranslatedText(translated);
+        message.setTranslatedText(text); // temporary — will be updated after AI
         messageRepository.save(message);
 
-        Map<String, String> receiverPayload = new HashMap<>();
-        receiverPayload.put("sender", senderUsername);
-        receiverPayload.put("original", text);
-        receiverPayload.put("translated", translated);
-        receiverPayload.put("timestamp", message.getTimestamp().toString());
-
-        messagingTemplate.convertAndSend(
-                "/topic/messages/" + receiverUsername,
-                receiverPayload
-        );
-
+        // Broadcast immediately to sender (always sees own original text)
         Map<String, String> senderPayload = new HashMap<>();
         senderPayload.put("sender", senderUsername);
         senderPayload.put("original", text);
         senderPayload.put("translated", text);
         senderPayload.put("timestamp", message.getTimestamp().toString());
+        senderPayload.put("messageId", message.getId().toString());
+        messagingTemplate.convertAndSend("/topic/messages/" + senderUsername, senderPayload);
 
-        messagingTemplate.convertAndSend(
-                "/topic/messages/" + senderUsername,
-                senderPayload
-        );
+        // Broadcast immediately to receiver with original text (⏳ pending)
+        Map<String, String> pendingPayload = new HashMap<>();
+        pendingPayload.put("sender", senderUsername);
+        pendingPayload.put("original", text);
+        pendingPayload.put("translated", text);  // show original until AI finishes
+        pendingPayload.put("timestamp", message.getTimestamp().toString());
+        pendingPayload.put("messageId", message.getId().toString());
+        pendingPayload.put("pending", "true");
+        messagingTemplate.convertAndSend("/topic/messages/" + receiverUsername, pendingPayload);
+
+        // ── Phase 2: Async Translation ────────────────────────────────────
+        translateAndUpdate(text, receiver, message, senderUsername, receiverUsername);
+    }
+
+    @Async
+    public void translateAndUpdate(String text, User receiver, Message message,
+                                   String senderUsername, String receiverUsername) {
+        try {
+            // Fetch recent history for context
+            User sender = message.getSender();
+            List<Message> recentMessages = messageRepository
+                    .findRecentMessages(sender, receiver, PageRequest.of(0, 5));
+            List<Message> chronological = new ArrayList<>(recentMessages);
+            Collections.reverse(chronological);
+
+            List<Map<String, String>> history = chronological.stream()
+                    .map(m -> {
+                        Map<String, String> entry = new HashMap<>();
+                        entry.put("speaker", m.getSender().getUsername());
+                        entry.put("text", m.getOriginalText());
+                        return entry;
+                    })
+                    .collect(Collectors.toList());
+
+            String translated = translationService.translate(
+                    text,
+                    receiver.getPreferredLanguage(),
+                    history
+            );
+
+            // Update the saved message with the real translation
+            message.setTranslatedText(translated);
+            messageRepository.save(message);
+
+            // Push the translated update to receiver
+            Map<String, String> translatedPayload = new HashMap<>();
+            translatedPayload.put("sender", senderUsername);
+            translatedPayload.put("original", text);
+            translatedPayload.put("translated", translated);
+            translatedPayload.put("timestamp", message.getTimestamp().toString());
+            translatedPayload.put("messageId", message.getId().toString());
+            translatedPayload.put("pending", "false");
+            messagingTemplate.convertAndSend("/topic/messages/" + receiverUsername, translatedPayload);
+
+        } catch (Exception e) {
+            log.error("[ChatController] Async translation failed: {}", e.getMessage());
+        }
     }
 }
+
